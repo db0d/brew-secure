@@ -1,0 +1,4 @@
+# >>> brew-secure >>>
+# shellcheck disable=SC1090
+[ -f "${HOME}/.config/homebrew/shell/interactive.sh" ] && . "${HOME}/.config/homebrew/shell/interactive.sh"
+# <<< brew-secure <<<

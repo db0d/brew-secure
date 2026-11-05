@@ -1,0 +1,10 @@
+# >>> brew-secure >>>
+# shellcheck disable=SC1090
+[ -f "${HOME}/.config/homebrew/shell/login.sh" ] && . "${HOME}/.config/homebrew/shell/login.sh"
+
+# Load ~/.bashrc for interactive login shells (common bash convention).
+if [ -n "${BASH_VERSION:-}" ] && [ -f "${HOME}/.bashrc" ]; then
+  # shellcheck disable=SC1090
+  . "${HOME}/.bashrc"
+fi
+# <<< brew-secure <<<
