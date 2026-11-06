@@ -1,0 +1,337 @@
+#!/usr/bin/env bash
+# brew-secure — apply Homebrew hardening and report brew vulns findings.
+#
+# Usage:
+#   brew-secure              # full check + interactive upgrade prompt
+#   brew-secure --startup    # same, intended for interactive shell startup
+#   brew-secure --apply-only # only ensure secure env / integrity checks
+#   brew-secure --scan-only  # only run brew vulns and print counts
+#   brew-secure --force      # ignore startup cache; always re-scan
+#
+# Env:
+#   BREW_SECURE_SKIP=1           Skip entirely (useful for nested shells/scripts)
+#   BREW_SECURE_CACHE_SECS=3600  Startup cache TTL (default 1 hour)
+#   BREW_SECURE_NO_UPDATE=1     Skip `brew update` before scanning
+#   BREW_SECURE_NO_PROMPT=1      Skip auto-upgrade and prompts
+
+set -euo pipefail
+
+readonly SCRIPT_NAME="brew-secure"
+readonly SECURE_ENV="${HOMEBREW_SECURE_ENV:-${HOME}/.config/homebrew/secure.env}"
+readonly CACHE_DIR="${XDG_CACHE_HOME:-${HOME}/Library/Caches}/brew-secure"
+readonly CACHE_JSON="${CACHE_DIR}/last-vulns.json"
+readonly CACHE_META="${CACHE_DIR}/last-scan.meta"
+readonly CACHE_SECS="${BREW_SECURE_CACHE_SECS:-3600}"
+
+MODE="full"
+FORCE=0
+STARTUP=0
+
+usage() {
+  sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'
+}
+
+log()  { printf '%s\n' "$*"; }
+info() { printf '\033[1m%s\033[0m\n' "$*"; }
+warn() { printf '\033[33m%s\033[0m\n' "$*" >&2; }
+err()  { printf '\033[31m%s\033[0m\n' "$*" >&2; }
+
+have_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+ensure_brew() {
+  if ! have_cmd brew; then
+    if [[ -x /opt/homebrew/bin/brew ]]; then
+      eval "$(/opt/homebrew/bin/brew shellenv bash)"
+    elif [[ -x /usr/local/bin/brew ]]; then
+      eval "$(/usr/local/bin/brew shellenv bash)"
+    else
+      err "${SCRIPT_NAME}: brew not found on PATH"
+      return 1
+    fi
+  fi
+}
+
+apply_secure_env() {
+  if [[ -f "${SECURE_ENV}" ]]; then
+    # shellcheck disable=SC1090
+    source "${SECURE_ENV}"
+    info "✓ Secure Homebrew env applied (${SECURE_ENV})"
+  else
+    warn "Missing ${SECURE_ENV}; applying built-in defaults"
+    export HOMEBREW_NO_INSECURE_REDIRECT=1
+    export HOMEBREW_NO_ANALYTICS=1
+    export HOMEBREW_FORBID_PACKAGES_FROM_PATHS=1
+    export HOMEBREW_VERIFY_ATTESTATIONS=1
+    case " ${HOMEBREW_CASK_OPTS-} " in
+      *" --require-sha "*) ;;
+      *) export HOMEBREW_CASK_OPTS="${HOMEBREW_CASK_OPTS:+${HOMEBREW_CASK_OPTS} }--require-sha" ;;
+    esac
+  fi
+}
+
+check_brew_integrity() {
+  local prefix brew_git remote head
+  prefix="$(brew --prefix 2>/dev/null || true)"
+  brew_git="$(brew --repository 2>/dev/null || true)"
+
+  if [[ -z "${prefix}" || ! -d "${prefix}" ]]; then
+    err "Could not resolve Homebrew prefix"
+    return 1
+  fi
+
+  if [[ "$(stat -f '%Su' "${prefix}" 2>/dev/null || true)" != "$(id -un)" ]]; then
+    warn "Homebrew prefix ${prefix} is not owned by $(id -un) — unexpected ownership"
+  else
+    info "✓ Homebrew prefix owned by $(id -un): ${prefix}"
+  fi
+
+  if [[ -n "${brew_git}" && -d "${brew_git}/.git" ]]; then
+    remote="$(git -C "${brew_git}" remote get-url origin 2>/dev/null || true)"
+    case "${remote}" in
+      https://github.com/Homebrew/brew|https://github.com/Homebrew/brew.git|git@github.com:Homebrew/brew.git|ssh://git@github.com/Homebrew/brew.git)
+        info "✓ brew git origin looks official (${remote})"
+        ;;
+      *)
+        warn "brew git origin is unexpected: ${remote:-<empty>}"
+        warn "  Expected https://github.com/Homebrew/brew"
+        ;;
+    esac
+    head="$(git -C "${brew_git}" rev-parse --short HEAD 2>/dev/null || true)"
+    info "  Homebrew $(brew --version | head -1) @ ${head:-unknown}"
+  fi
+}
+
+cache_fresh() {
+  [[ "${FORCE}" -eq 1 ]] && return 1
+  [[ -f "${CACHE_JSON}" && -f "${CACHE_META}" ]] || return 1
+  local ts now age
+  ts="$(awk -F= '/^timestamp=/{print $2; exit}' "${CACHE_META}" 2>/dev/null || echo 0)"
+  now="$(date +%s)"
+  age=$((now - ts))
+  [[ "${age}" -ge 0 && "${age}" -lt "${CACHE_SECS}" ]]
+}
+
+write_cache_meta() {
+  local status="$1" checked="$2" complete="$3"
+  mkdir -p "${CACHE_DIR}"
+  cat >"${CACHE_META}" <<EOF
+timestamp=$(date +%s)
+status=${status}
+checked=${checked}
+complete=${complete}
+brew_version=$(brew --version | head -1 | tr -d '\n')
+EOF
+}
+
+run_update() {
+  if [[ "${BREW_SECURE_NO_UPDATE:-0}" == "1" ]]; then
+    warn "Skipping brew update (BREW_SECURE_NO_UPDATE=1)"
+    return 0
+  fi
+  info "Updating Homebrew and formula metadata…"
+  # Keep brew itself current; vulns data depends on fresh metadata.
+  brew update --quiet || brew update
+}
+
+scan_vulns() {
+  mkdir -p "${CACHE_DIR}"
+  local tmp_json tmp_err status
+  tmp_json="$(mktemp "${CACHE_DIR}/vulns.XXXXXX.json")"
+  tmp_err="$(mktemp "${CACHE_DIR}/vulns.XXXXXX.err")"
+  status=0
+
+  info "Scanning installed formulae with brew vulns…"
+  # brew itself is kept current via brew update; formulae (incl. deps of brew tooling) via vulns.
+  if ! brew vulns --json >"${tmp_json}" 2>"${tmp_err}"; then
+    status=$?
+  fi
+
+  if ! jq -e . >/dev/null 2>&1 <"${tmp_json}"; then
+    err "brew vulns did not return valid JSON"
+    [[ -s "${tmp_err}" ]] && cat "${tmp_err}" >&2
+    rm -f "${tmp_json}" "${tmp_err}"
+    return 1
+  fi
+
+  if [[ -s "${tmp_err}" ]]; then
+    # Non-fatal chatter / coverage notes
+    sed 's/^/  /' "${tmp_err}" >&2 || true
+  fi
+
+  mv "${tmp_json}" "${CACHE_JSON}"
+  local checked complete
+  checked="$(jq -r '.checked // 0' "${CACHE_JSON}")"
+  complete="$(jq -r '.complete // false' "${CACHE_JSON}")"
+  write_cache_meta "${status}" "${checked}" "${complete}"
+  rm -f "${tmp_err}"
+  return 0
+}
+
+count_severity() {
+  local sev="$1"
+  jq -r --arg s "${sev}" '
+    [
+      .findings[]?.vulnerabilities[]?
+      | (.severity // "UNKNOWN")
+      | ascii_upcase
+      | select(. == ($s | ascii_upcase))
+    ] | length
+  ' "${CACHE_JSON}"
+}
+
+report_counts() {
+  local critical high medium low unknown checked complete skipped unscanned age_note
+  critical="$(count_severity CRITICAL)"
+  high="$(count_severity HIGH)"
+  medium="$(count_severity MEDIUM)"
+  low="$(count_severity LOW)"
+  unknown="$(jq -r '[.findings[]?.vulnerabilities[]? | (.severity // "UNKNOWN") | ascii_upcase | select(. != "CRITICAL" and . != "HIGH" and . != "MEDIUM" and . != "LOW")] | length' "${CACHE_JSON}")"
+  checked="$(jq -r '.checked // 0' "${CACHE_JSON}")"
+  complete="$(jq -r '.complete // false' "${CACHE_JSON}")"
+  skipped="$(jq -r '(.skipped_formulae // []) | length' "${CACHE_JSON}")"
+  unscanned="$(jq -r '(.unscanned_formulae // {} | keys) | length' "${CACHE_JSON}")"
+
+  if [[ -f "${CACHE_META}" ]]; then
+    local ts now
+    ts="$(awk -F= '/^timestamp=/{print $2; exit}' "${CACHE_META}")"
+    now="$(date +%s)"
+    age_note=" (scanned $(( (now - ts) / 60 ))m ago)"
+  else
+    age_note=""
+  fi
+
+  echo
+  info "Homebrew vulnerability summary${age_note}"
+  printf '  Formulae checked : %s\n' "${checked}"
+  printf '  Scan complete    : %s\n' "${complete}"
+  printf '  Critical         : %s\n' "${critical}"
+  printf '  High             : %s\n' "${high}"
+  printf '  Medium           : %s\n' "${medium}"
+  printf '  Low              : %s\n' "${low}"
+  if [[ "${unknown}" -gt 0 ]]; then
+    printf '  Unknown severity : %s\n' "${unknown}"
+  fi
+  if [[ "${skipped}" -gt 0 || "${unscanned}" -gt 0 ]]; then
+    printf '  Skipped / unscanned formulae: %s / %s\n' "${skipped}" "${unscanned}"
+    warn "Some packages were not fully assessed. Run: brew vulns --list-skipped"
+  fi
+
+  if [[ "${checked}" -eq 0 ]]; then
+    warn "No installed formulae were scanned (empty Cellar?). brew itself is updated via brew update."
+  fi
+
+  # Export for callers / prompt logic
+  BREW_SECURE_CRITICAL="${critical}"
+  BREW_SECURE_HIGH="${high}"
+  BREW_SECURE_MEDIUM="${medium}"
+  BREW_SECURE_LOW="${low}"
+  BREW_SECURE_UNKNOWN="${unknown}"
+  BREW_SECURE_TOTAL=$((critical + high + medium + low + unknown))
+}
+
+run_upgrade_and_rescan() {
+  local reason="$1"
+  info "${reason}"
+  brew upgrade
+  info "Re-scanning after upgrade…"
+  FORCE=1
+  scan_vulns
+  report_counts
+}
+
+maybe_prompt_upgrade() {
+  if [[ "${BREW_SECURE_NO_PROMPT:-0}" == "1" ]]; then
+    return 0
+  fi
+
+  local critical="${BREW_SECURE_CRITICAL:-0}"
+  local high="${BREW_SECURE_HIGH:-0}"
+  local medium="${BREW_SECURE_MEDIUM:-0}"
+  local low="${BREW_SECURE_LOW:-0}"
+  local unknown="${BREW_SECURE_UNKNOWN:-0}"
+  local severe=$((critical + high))
+  local mild=$((medium + low + unknown))
+
+  # No open findings → stay quiet.
+  if [[ "${severe}" -eq 0 && "${mild}" -eq 0 ]]; then
+    return 0
+  fi
+
+  # Critical/High → upgrade automatically (still requires a TTY for safety in startup).
+  if [[ "${severe}" -gt 0 ]]; then
+    if [[ ! -t 1 ]]; then
+      warn "Critical/High findings present, but no TTY — skipping automatic brew upgrade."
+      return 0
+    fi
+    run_upgrade_and_rescan "Critical/High findings detected (${critical} critical, ${high} high). Running brew upgrade…"
+    return 0
+  fi
+
+  # Medium/Low/Unknown only → ask.
+  if [[ ! -t 0 || ! -t 1 ]]; then
+    return 0
+  fi
+
+  local reply detail
+  detail="${medium} medium, ${low} low"
+  if [[ "${unknown}" -gt 0 ]]; then
+    detail="${detail}, ${unknown} unknown"
+  fi
+  printf 'Medium/Low findings (%s). Run brew upgrade now? [y/N] ' "${detail}"
+  read -r reply || true
+  case "${reply}" in
+    y|Y|yes|YES)
+      run_upgrade_and_rescan "Running brew upgrade…"
+      ;;
+    *)
+      log "Skipped brew upgrade."
+      ;;
+  esac
+}
+
+main() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -h|--help) usage; return 0 ;;
+      --startup) STARTUP=1; shift ;;
+      --force) FORCE=1; shift ;;
+      --apply-only) MODE="apply"; shift ;;
+      --scan-only) MODE="scan"; shift ;;
+      *) err "Unknown option: $1"; usage; return 2 ;;
+    esac
+  done
+
+  if [[ "${BREW_SECURE_SKIP:-0}" == "1" ]]; then
+    return 0
+  fi
+
+  # Startup mode is only useful on a real interactive TTY.
+  if [[ "${STARTUP}" -eq 1 ]]; then
+    [[ -t 0 && -t 1 ]] || return 0
+  fi
+
+  ensure_brew
+  apply_secure_env
+  check_brew_integrity
+
+  if [[ "${MODE}" == "apply" ]]; then
+    return 0
+  fi
+
+  if [[ "${STARTUP}" -eq 1 ]] && cache_fresh; then
+    info "Using cached brew vulns results (< ${CACHE_SECS}s). Pass --force to re-scan."
+    report_counts
+    maybe_prompt_upgrade
+    return 0
+  fi
+
+  run_update
+  scan_vulns
+  report_counts
+
+  if [[ "${MODE}" != "scan" ]]; then
+    maybe_prompt_upgrade
+  fi
+}
+
+main "$@"
